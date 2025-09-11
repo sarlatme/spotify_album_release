@@ -51,42 +51,139 @@ NEW_RELEASE=$(curl -s --request GET --url https://api.spotify.com/v1/browse/new-
 TOP_ARTISTS_SHORT=$(curl -s --request GET --url 'https://api.spotify.com/v1/me/top/artists?time_range=short_term&limit=50' --header "Authorization: Bearer $ACCESS_TOKEN")
 TOP_ARTISTS_MEDIUM=$(curl -s --request GET --url 'https://api.spotify.com/v1/me/top/artists?time_range=medium_term&limit=50' --header "Authorization: Bearer $ACCESS_TOKEN")
 TOP_ARTISTS_LONG=$(curl -s --request GET --url 'https://api.spotify.com/v1/me/top/artists?time_range=long_term&limit=50' --header "Authorization: Bearer $ACCESS_TOKEN")
+ARTISTS_SHORT=$(echo "$TOP_ARTISTS_SHORT" | jq -s '{items: ([.[].items] | add)}')
+ARTISTS_MEDIUM=$(echo "$TOP_ARTISTS_MEDIUM" | jq -s '{items: ([.[].items] | add)}')
+ARTISTS_LONG=$(echo "$TOP_ARTISTS_LONG" | jq -s '{items: ([.[].items] | add)}')
 
 TOP_TRACKS_SHORT=$(curl -s --request GET --url 'https://api.spotify.com/v1/me/top/tracks?time_range=short_term&limit=50' --header "Authorization: Bearer $ACCESS_TOKEN")
 TOP_TRACKS_MEDIUM=$(curl -s --request GET --url 'https://api.spotify.com/v1/me/top/tracks?time_range=medium_term&limit=50' --header "Authorization: Bearer $ACCESS_TOKEN")
 TOP_TRACKS_LONG=$(curl -s --request GET --url 'https://api.spotify.com/v1/me/top/tracks?time_range=long_term&limit=50' --header "Authorization: Bearer $ACCESS_TOKEN")
 
-# RECOMMENDATIONS_SPOTIFY=$(curl -s --request GET --url 'https://api.spotify.com/v1/recommendations?seed_artists=4NHQUGzhtTLFvgF5SZesLK&seed_genres=classical%2Ccountry&seed_tracks=0c6xIDDpzE81m2q797ordA' --header "Authorization: Bearer $ACCESS_TOKEN")
+# (nettoyage) suppression des affichages non nécessaires au scoring
 
-get_top_genres() {
-    local artists_data="$1"
-    local temp_genres_file="/tmp/spotify_genres_$$"
+# Attribution d'une note aux NEW_RELEASE selon présence des artistes/genres dans les tops
+# Construire les ensembles d'IDs d'artistes par période
+SHORT_IDS_JSON=$(echo "$ARTISTS_SHORT" | jq '[.items[].id]')
+MEDIUM_IDS_JSON=$(echo "$ARTISTS_MEDIUM" | jq '[.items[].id]')
+LONG_IDS_JSON=$(echo "$ARTISTS_LONG" | jq '[.items[].id]')
 
-    echo "$artists_data" | jq -r '.items[].genres[]' | sort | uniq -c | sort -nr > "$temp_genres_file"
-    local genres_list=()
-    while IFS= read -r line; do
-        genre=$(echo "$line" | sed 's/^[[:space:]]*[0-9]*[[:space:]]*//')
-        genres_list+=("$genre")
-    done < "$temp_genres_file"
+# Construire les ensembles de genres par période (dérivés des artistes)
+SHORT_GENRES_JSON=$(echo "$ARTISTS_SHORT" | jq '[.items[].genres[]?] | unique')
+MEDIUM_GENRES_JSON=$(echo "$ARTISTS_MEDIUM" | jq '[.items[].genres[]?] | unique')
+LONG_GENRES_JSON=$(echo "$ARTISTS_LONG" | jq '[.items[].genres[]?] | unique')
 
-    rm -f "$temp_genres_file"
+# Construire une map artisteId -> genres (union des périodes)
+ALL_ARTISTS_UNION=$(echo "$ARTISTS_SHORT $ARTISTS_MEDIUM $ARTISTS_LONG" | jq -s '[.[].items[]] | sort_by(.id) | unique_by(.id)')
+ARTIST_MAP_JSON=$(echo "$ALL_ARTISTS_UNION" | jq 'map({key: .id, value: (.genres // [])}) | from_entries')
 
-    IFS=','
-    echo "${genres_list[*]}"
-} 
+# Compléter la map avec les artistes de NEW_RELEASE non connus (pour récupérer leurs genres)
+NEW_RELEASE_ARTIST_IDS=$(echo "$NEW_RELEASE" | jq -r '.albums.items[].artists[].id' | sort -u)
+KNOWN_ARTIST_IDS=$(echo "$ARTIST_MAP_JSON" | jq -r 'keys[]' | sort -u)
+MISSING_ARTIST_IDS=$(comm -23 <(echo "$NEW_RELEASE_ARTIST_IDS") <(echo "$KNOWN_ARTIST_IDS"))
 
-ARTISTS_SHORT=$(echo "$TOP_ARTISTS_SHORT" | jq -s '{items: ([.[].items] | add)}')
-ARTISTS_MEDIUM=$(echo "$TOP_ARTISTS_MEDIUM" | jq -s '{items: ([.[].items] | add)}')
-ARTISTS_LONG=$(echo "$TOP_ARTISTS_LONG" | jq -s '{items: ([.[].items] | add)}')
+if [ -n "$MISSING_ARTIST_IDS" ]; then
+    while IFS= read -r batch; do
+        batch=${batch%,}
+        if [ -n "$batch" ]; then
+            RESP=$(curl -s --request GET --url "https://api.spotify.com/v1/artists?ids=$batch" --header "Authorization: Bearer $ACCESS_TOKEN")
+            EXTRA_MAP=$(echo "$RESP" | jq '(.artists // []) | map({key: .id, value: (.genres // [])}) | from_entries')
+            ARTIST_MAP_JSON=$(printf '%s\n%s' "$ARTIST_MAP_JSON" "$EXTRA_MAP" | jq -s '.[0] * .[1]')
+        fi
+    done < <(echo "$MISSING_ARTIST_IDS" | awk 'NR%50{printf $0","; next} {print $0} END{if(NR%50)print ""}')
+fi
 
-ARTISTS_SHORT_GENRES=$(get_top_genres "$ARTISTS_SHORT")
-ARTISTS_MEDIUM_GENRES=$(get_top_genres "$ARTISTS_MEDIUM")
-ARTISTS_LONG_GENRES=$(get_top_genres "$ARTISTS_LONG")
+# (nettoyage) suppression des affichages des genres par période et par album
 
-echo "Genres des artistes : $ARTISTS_SHORT_GENRES"
-echo "Genres des artistes : $ARTISTS_MEDIUM_GENRES"
-echo "Genres des artistes : $ARTISTS_LONG_GENRES"
+# Construire l'ensemble des albums provenant de mes tracks favoris (IDs)
+FAV_ALBUM_IDS_JSON=$(echo "$TOP_TRACKS_SHORT $TOP_TRACKS_MEDIUM $TOP_TRACKS_LONG" | jq -s '[.[].items[]?.album.id] | unique')
 
-# Lister les albums des top tracks (uniques)
-ALL_TRACKS_AlBUMS=$(echo "$TOP_TRACKS_SHORT $TOP_TRACKS_MEDIUM $TOP_TRACKS_LONG" | jq -s '{items: ([.[].items] | add)}')
-echo "$ALL_TRACKS_AlBUMS" | jq -r '.items[].album.name' | sort -u
+# Calculer les jours depuis la sortie pour chaque album (fraîcheur)
+NOW_EPOCH=$(date +%s)
+RELEASE_DAYS_MAP_JSON='{}'
+while IFS=$'\t' read -r ALB_ID ALB_DATE ALB_PREC; do
+    [ -z "$ALB_ID" ] && continue
+    NORM_DATE="$ALB_DATE"
+    if [ "$ALB_PREC" = "year" ]; then
+        NORM_DATE="$ALB_DATE-01-01"
+    elif [ "$ALB_PREC" = "month" ]; then
+        NORM_DATE="$ALB_DATE-01"
+    fi
+    ALB_EPOCH=$(date -d "$NORM_DATE" +%s 2>/dev/null || echo "")
+    if [ -n "$ALB_EPOCH" ]; then
+        DAYS=$(( (NOW_EPOCH - ALB_EPOCH) / 86400 ))
+        [ $DAYS -lt 0 ] && DAYS=0
+        RELEASE_DAYS_MAP_JSON=$(printf '%s' "$RELEASE_DAYS_MAP_JSON" | jq --arg id "$ALB_ID" --argjson d $DAYS '. + {($id): $d}')
+    fi
+done < <(echo "$NEW_RELEASE" | jq -r '.albums.items[] | [.id, .release_date, .release_date_precision] | @tsv')
+
+# Récupérer la popularité des albums NEW_RELEASE (full albums, batch de 20)
+ALBUM_IDS=$(echo "$NEW_RELEASE" | jq -r '.albums.items[].id' | sort -u)
+ALBUM_POP_MAP_JSON='{}'
+if [ -n "$ALBUM_IDS" ]; then
+    while IFS= read -r batch; do
+        batch=${batch%,}
+        if [ -n "$batch" ]; then
+            RESP=$(curl -s --request GET --url "https://api.spotify.com/v1/albums?ids=$batch" --header "Authorization: Bearer $ACCESS_TOKEN")
+            EXTRA_MAP=$(echo "$RESP" | jq '(.albums // []) | map({key: .id, value: (.popularity // 0)}) | from_entries')
+            ALBUM_POP_MAP_JSON=$(printf '%s\n%s' "$ALBUM_POP_MAP_JSON" "$EXTRA_MAP" | jq -s '.[0] * .[1]')
+        fi
+    done < <(echo "$ALBUM_IDS" | awk 'NR%20{printf $0","; next} {print $0} END{if(NR%20)print ""}')
+fi
+
+# Calculer les scores des albums de NEW_RELEASE
+SCORED_NEW_RELEASES=$(echo "$NEW_RELEASE" | jq \
+  --argjson short "$SHORT_IDS_JSON" \
+  --argjson medium "$MEDIUM_IDS_JSON" \
+  --argjson long "$LONG_IDS_JSON" \
+  --argjson shortGenres "$SHORT_GENRES_JSON" \
+  --argjson mediumGenres "$MEDIUM_GENRES_JSON" \
+  --argjson longGenres "$LONG_GENRES_JSON" \
+  --argjson artistMap "$ARTIST_MAP_JSON" \
+  --argjson albumPopMap "$ALBUM_POP_MAP_JSON" \
+  --argjson releaseDaysMap "$RELEASE_DAYS_MAP_JSON" \
+  --argjson favAlbums "$FAV_ALBUM_IDS_JSON" \
+  '
+  .albums.items
+  | map(
+      (.artists | map({id, name})) as $arts
+      | [ $arts[].id ] as $aids
+      | (($short | map(select(. as $sid | $aids | index($sid))) | length) > 0) as $inShort
+      | (($medium | map(select(. as $sid | $aids | index($sid))) | length) > 0) as $inMedium
+      | (($long | map(select(. as $sid | $aids | index($sid))) | length) > 0) as $inLong
+      | (if $inShort then 40 elif $inMedium then 25 elif $inLong then 15 else 0 end) as $artistScore
+      | ([$arts[].id] | map(. as $aid | $artistMap[$aid] // []) | add | unique) as $albumGenres
+      | (($albumGenres | map(
+            if ($shortGenres | index(.)) then 30
+            elif ($mediumGenres | index(.)) then 20
+            elif ($longGenres | index(.)) then 10
+            else 0 end
+          ) | add) // 0) as $genreScore
+      | (if ($albumGenres | length) == 0 then 5 else 0 end) as $noGenreBonus
+      | ($albumPopMap[.id] // 0) as $popularity
+      | ($popularity * 0.2) as $popularityScore
+      | ($releaseDaysMap[.id] // 0) as $daysSinceRelease
+      | (30 - $daysSinceRelease) as $freshnessScore
+      | (.id) as $albumId
+      | (($favAlbums | index($albumId)) != null) as $inFavAlbums
+      | (if $inFavAlbums then 50 else 0 end) as $favAlbumBonus
+      | ($artistScore + $genreScore + $noGenreBonus + $popularityScore + $freshnessScore + $favAlbumBonus) as $score
+      | {
+          name: .name,
+          artists: $arts,
+          artistScore: $artistScore,
+          genreScore: $genreScore,
+          noGenreBonus: $noGenreBonus,
+          popularity: $popularity,
+          popularityScore: $popularityScore,
+          daysSinceRelease: $daysSinceRelease,
+          freshnessScore: $freshnessScore,
+          favAlbumBonus: $favAlbumBonus,
+          score: $score
+        }
+    )
+  | sort_by(.score) | reverse
+  ')
+
+RESULT_LINES=$(echo "$SCORED_NEW_RELEASES" | jq -r '.[] | select(.score > 0) | "\(.score)\t\(.name)\t-\t\([.artists[].name] | join(", "))"')
+echo "$RESULT_LINES"
+
