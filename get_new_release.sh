@@ -28,5 +28,4 @@ NEW_RELEASE=$(curl --request GET --url https://api.spotify.com/v1/browse/new-rel
 #Extraction et affichage des noms d'albums et artistes
 # echo "$NEW_RELEASE" | jq -r '.albums.items[] | "\(.name) - \(.artists[0].name) - \(.artists[0].external_urls.spotify)"'
 
-TOP_ARTIST=$(curl --request GET --url https://api.spotify.com/v1/me/top/artists --header "Authorization: Bearer $ACCESS_TOKEN")
-echo "$TOP_ARTIST"
+echo "$NEW_RELEASE"
